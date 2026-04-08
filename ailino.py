@@ -15,12 +15,12 @@ st.markdown("""
      padding: 30px; border-radius: 15px; margin-bottom: 20px;'>
     <h1 style='color: #00ff88; font-size: 3em; font-family: Arial Black;'>🤖 AI.LINO PRO</h1>
     <h3 style='color: #ffffff;'>Motor de Rebote — HMM + RSI + Volumen + Niveles Exactos</h3>
-    <p style='color: #aaaaaa;'>Detecta agotamiento de vendedores · Entrada precisa · Stop Loss automático</p>
+    <p style='color: #aaaaaa;'>Detecta agotamiento de vendedores · Entrada precisa · Stop Loss automatico</p>
 </div>
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# BÚSQUEDA
+# BUSQUEDA
 # ─────────────────────────────────────────────
 def buscar_sugerencias(texto):
     try:
@@ -32,15 +32,15 @@ def buscar_sugerencias(texto):
                 nombre = q.get("longname") or q.get("shortname", ticker)
                 tipo   = q.get("quoteType", "")
                 if ticker.endswith(".MX"):
-                    pais = "🇲🇽"
+                    pais = "MX"
                 elif any(ticker.endswith(x) for x in [".PA",".DE",".AS",".SW",".MC",".MI",".L"]):
-                    pais = "🇪🇺"
+                    pais = "EU"
                 elif tipo == "CRYPTOCURRENCY":
-                    pais = "🪙"
+                    pais = "CRYPTO"
                 else:
-                    pais = "🇺🇸"
+                    pais = "USA"
                 sugerencias.append({
-                    "label": f"{pais} {nombre} ({ticker})",
+                    "label": f"[{pais}] {nombre} ({ticker})",
                     "ticker": ticker,
                     "nombre": nombre,
                     "pais": pais
@@ -71,7 +71,6 @@ def calcular_rsi(precios, periodo=14):
     return 100 - (100 / (1 + rs))
 
 def calcular_stoch_rsi(precios, periodo=14, smooth=3):
-    """Stochastic RSI — detecta agotamiento extremo más rápido que RSI normal"""
     rsi     = calcular_rsi(precios, periodo)
     rsi_min = rsi.rolling(periodo).min()
     rsi_max = rsi.rolling(periodo).max()
@@ -93,11 +92,120 @@ def calcular_bollinger(precios, periodo=20):
     std   = precios.rolling(periodo).std()
     return media + 2*std, media, media - 2*std
 
+# ─────────────────────────────────────────────
+# MOTOR DE AGOTAMIENTO DE VENDEDORES (5 CAPAS)
+# ─────────────────────────────────────────────
+def detectar_agotamiento_vendedores(df):
+    """
+    Detector inteligente de agotamiento de vendedores.
+    5 capas independientes — cada una detecta una forma distinta
+    en que los vendedores pierden fuerza antes del rebote.
+
+    Retorna: (confirmado, nivel 0-3, descripcion, lista_detalles)
+    """
+    if len(df) < 15:
+        return False, 0, "Sin datos suficientes", []
+
+    close  = df['Close'].squeeze()
+    volume = df['Volume'].squeeze()
+    high   = df['High'].squeeze()
+    low    = df['Low'].squeeze()
+
+    puntos   = 0
+    detalles = []
+
+    # ── CAPA 1: Divergencia precio-volumen clasica (3 ventanas) ──
+    # Precio baja pero volumen tambien baja = vendedores perdiendo fuerza
+    for v in [3, 5, 8]:
+        if len(df) >= v * 2:
+            p_rec   = close.iloc[-v:].mean()
+            p_ant   = close.iloc[-v*2:-v].mean()
+            vol_rec = volume.iloc[-v:].mean()
+            vol_ant = volume.iloc[-v*2:-v].mean()
+            if p_rec < p_ant and vol_rec < vol_ant:
+                reduccion = ((vol_ant - vol_rec) / vol_ant) * 100
+                puntos += 1
+                detalles.append(
+                    f"Volumen cae {reduccion:.0f}% mientras precio baja (ventana {v}d)"
+                )
+
+    # ── CAPA 2: Rechazo de precios bajos (mechas inferiores largas) ──
+    # El mercado toca minimos pero cierra arriba = compradores absorbiendo
+    rechazos = 0
+    for i in range(-5, 0):
+        o = float(df['Open'].iloc[i])
+        h = float(df['High'].iloc[i])
+        l = float(df['Low'].iloc[i])
+        c = float(df['Close'].iloc[i])
+        cuerpo    = abs(c - o) + 1e-10
+        mecha_inf = min(o, c) - l
+        rango     = h - l + 1e-10
+        if mecha_inf > cuerpo * 1.5 and mecha_inf / rango > 0.35:
+            rechazos += 1
+    if rechazos >= 2:
+        puntos += 2
+        detalles.append(
+            f"{rechazos} velas con rechazo de minimos — compradores absorbiendo presion"
+        )
+    elif rechazos == 1:
+        puntos += 1
+        detalles.append("1 vela con rechazo de minimos detectada")
+
+    # ── CAPA 3: Volumen en dias bajistas decreciendo ──
+    # Los dias de baja tienen cada vez menos volumen = vendedores secandose
+    vols_bajas = []
+    for i in range(-8, 0):
+        if float(close.iloc[i]) < float(df['Open'].iloc[i]):
+            vols_bajas.append(float(volume.iloc[i]))
+    if len(vols_bajas) >= 3:
+        mitad        = len(vols_bajas) // 2
+        vol_reciente = sum(vols_bajas[mitad:]) / max(len(vols_bajas[mitad:]), 1)
+        vol_anterior = sum(vols_bajas[:mitad]) / max(mitad, 1)
+        if vol_reciente < vol_anterior * 0.85:
+            reduccion = ((vol_anterior - vol_reciente) / vol_anterior) * 100
+            puntos += 2
+            detalles.append(
+                f"Dias bajistas con volumen {reduccion:.0f}% menor — vendedores agotandose"
+            )
+
+    # ── CAPA 4: Compresion de rangos (momentum perdiendo fuerza) ──
+    # Velas cada vez mas pequenas = la caida pierde velocidad
+    rangos_rec = [float(high.iloc[i]) - float(low.iloc[i]) for i in range(-5, 0)]
+    rangos_ant = [float(high.iloc[i]) - float(low.iloc[i]) for i in range(-10, -5)]
+    if rangos_ant and sum(rangos_ant) > 0:
+        rango_rec = sum(rangos_rec) / len(rangos_rec)
+        rango_ant = sum(rangos_ant) / len(rangos_ant)
+        if rango_rec < rango_ant * 0.80:
+            compresion = ((rango_ant - rango_rec) / rango_ant) * 100
+            puntos += 1
+            detalles.append(
+                f"Rango diario comprimido {compresion:.0f}% — la caida pierde velocidad"
+            )
+
+    # ── CAPA 5: Doble piso (soporte fuerte confirmado) ──
+    # El precio toca el mismo nivel 2 veces sin romperlo = piso real
+    min_rec = float(low.iloc[-5:].min())
+    min_ant = float(low.iloc[-15:-5].min())
+    if min_ant > 0:
+        tolerancia = min_ant * 0.015  # 1.5% de tolerancia
+        if abs(min_rec - min_ant) <= tolerancia:
+            puntos += 3
+            detalles.append(
+                f"Doble piso en ${min_rec:.2f} — soporte fuerte confirmado en 2 toques"
+            )
+
+    # ── DECISION FINAL ──
+    if puntos >= 6:
+        return True, 3, "AGOTAMIENTO FUERTE — Rebote de alta probabilidad", detalles
+    elif puntos >= 4:
+        return True, 2, "AGOTAMIENTO MODERADO — Señales positivas acumulandose", detalles
+    elif puntos >= 2:
+        return True, 1, "AGOTAMIENTO DEBIL — Primeras señales visibles", detalles
+    else:
+        return False, 0, "Sin agotamiento confirmado aun", detalles
+
+
 def detectar_vela_rebote(df):
-    """
-    Detecta velas de reversión alcista:
-    Hammer, Doji, Engulfing alcista
-    """
     senales = []
     if len(df) < 2:
         return senales
@@ -110,13 +218,10 @@ def detectar_vela_rebote(df):
         rango_total = h - l + 1e-10
         mecha_inf   = min(o, c) - l
         mecha_sup   = h - max(o, c)
-        # Hammer
         if mecha_inf >= 2 * cuerpo and mecha_sup <= cuerpo * 0.5 and cuerpo / rango_total < 0.4:
             senales.append((df.index[i], "Hammer", "#00ff88"))
-        # Doji
         elif cuerpo / rango_total < 0.1:
             senales.append((df.index[i], "Doji", "#FFD700"))
-        # Engulfing alcista
         elif i > 0:
             o_prev = float(df['Open'].iloc[i-1])
             c_prev = float(df['Close'].iloc[i-1])
@@ -124,29 +229,7 @@ def detectar_vela_rebote(df):
                 senales.append((df.index[i], "Engulfing Alcista", "#00BFFF"))
     return senales
 
-def detectar_divergencia_volumen(df, ventana=5):
-    """
-    Agotamiento de vendedores:
-    precio sigue bajando pero volumen decrece
-    """
-    if len(df) < ventana * 2:
-        return False, 0
-    precios_rec = df['Close'].iloc[-ventana:].values
-    vol_rec     = df['Volume'].iloc[-ventana:].values
-    precios_ant = df['Close'].iloc[-ventana*2:-ventana].values
-    vol_ant     = df['Volume'].iloc[-ventana*2:-ventana].values
-    precio_baja  = precios_rec[-1] < precios_ant[-1]
-    volumen_baja = vol_rec.mean() < vol_ant.mean()
-    if precio_baja and volumen_baja:
-        reduccion = ((vol_ant.mean() - vol_rec.mean()) / vol_ant.mean()) * 100
-        return True, round(reduccion, 1)
-    return False, 0
-
 def calcular_niveles_trading(df, precio_actual):
-    """
-    Niveles precisos de entrada, stop loss y objetivos
-    basados en soportes reales y ATR
-    """
     close = df['Close'].squeeze()
     high  = df['High'].squeeze()
     low   = df['Low'].squeeze()
@@ -185,25 +268,26 @@ def calcular_niveles_trading(df, precio_actual):
     }
 
 def calcular_score_rebote(estado_hmm, rsi, stoch_k, stoch_d,
-                           macd_val, signal_val, agotamiento_vol,
+                           macd_val, signal_val, agot_nivel,
                            velas_rebote, precio_vs_bb_low):
-    """Score especializado en detectar rebotes."""
     score   = 50
     razones = []
     alertas = []
+
     # HMM
     if estado_hmm == "ALCISTA":
         score += 15
         razones.append("HMM detecta regimen alcista")
     elif estado_hmm == "BAJISTA":
         score -= 10
-        alertas.append("HMM en regimen bajista — rebote de corta duracion esperado")
+        alertas.append("HMM bajista — rebote de corta duracion posible")
     else:
-        razones.append("HMM en lateral — posible acumulacion")
+        razones.append("HMM lateral — posible acumulacion")
+
     # RSI
     if rsi < 25:
         score += 25
-        razones.append(f"RSI extremo ({rsi:.1f}) — agotamiento de vendedores fuerte")
+        razones.append(f"RSI extremo ({rsi:.1f}) — sobreventa severa")
     elif rsi < 35:
         score += 15
         razones.append(f"RSI en sobreventa ({rsi:.1f}) — zona de rebote")
@@ -213,16 +297,18 @@ def calcular_score_rebote(estado_hmm, rsi, stoch_k, stoch_d,
     elif rsi > 60:
         score -= 10
         alertas.append(f"RSI elevado ({rsi:.1f}) — cuidado")
+
     # Stoch RSI
     if stoch_k < 20 and stoch_d < 20:
         score += 20
-        razones.append(f"Stoch RSI en zona extrema ({stoch_k:.1f}) — rebote inminente")
+        razones.append(f"Stoch RSI extremo ({stoch_k:.1f}) — rebote inminente")
     elif stoch_k > stoch_d and stoch_k < 40:
         score += 10
-        razones.append(f"Stoch RSI cruzando al alza ({stoch_k:.1f}) — impulso iniciando")
+        razones.append(f"Stoch RSI cruzando alza ({stoch_k:.1f}) — impulso iniciando")
     elif stoch_k > 80:
         score -= 15
         alertas.append(f"Stoch RSI sobrecomprado ({stoch_k:.1f}) — salir pronto")
+
     # MACD
     if macd_val > signal_val:
         score += 10
@@ -230,23 +316,33 @@ def calcular_score_rebote(estado_hmm, rsi, stoch_k, stoch_d,
     else:
         score -= 5
         alertas.append("MACD bajo senal — presion vendedora activa")
-    # Agotamiento volumen
-    if agotamiento_vol[0]:
-        score += 20
-        razones.append(f"Volumen de venta cae {agotamiento_vol[1]}% — vendedores agotados")
+
+    # Agotamiento (ahora con niveles 0-3)
+    if agot_nivel == 3:
+        score += 25
+        razones.append("Agotamiento de vendedores FUERTE confirmado")
+    elif agot_nivel == 2:
+        score += 15
+        razones.append("Agotamiento de vendedores MODERADO confirmado")
+    elif agot_nivel == 1:
+        score += 8
+        razones.append("Primeras señales de agotamiento detectadas")
     else:
-        alertas.append("Volumen sin divergencia confirmada aun")
+        alertas.append("Agotamiento de vendedores sin confirmar")
+
     # Velas
     if len(velas_rebote) > 0:
         score += 15
         razones.append(f"Patron de vela: {velas_rebote[-1][1]} detectado")
+
     # Bollinger
     if precio_vs_bb_low < 0:
         score += 15
-        razones.append("Precio bajo Banda Bollinger inferior — zona de reversion estadistica")
+        razones.append("Precio bajo BB inferior — zona de reversion estadistica")
     elif precio_vs_bb_low < 2:
         score += 5
-        razones.append("Precio rozando Banda Bollinger inferior")
+        razones.append("Precio rozando BB inferior")
+
     return max(0, min(100, score)), razones, alertas
 
 # ─────────────────────────────────────────────
@@ -297,8 +393,11 @@ class MaquinaDineroLino:
             macd_val         = macd.iloc[-1]
             signal_val       = signal.iloc[-1]
 
-            df_chart    = t.history(period="3mo", interval="1d")
-            agotamiento = detectar_divergencia_volumen(df_chart)
+            df_chart = t.history(period="3mo", interval="1d")
+
+            # Agotamiento con nuevo motor de 5 capas
+            agot_ok, agot_nivel, agot_desc, agot_detalles = detectar_agotamiento_vendedores(df_chart)
+
             velas_rev   = detectar_vela_rebote(df_chart.tail(10))
 
             _, _, bb_low_s = calcular_bollinger(close)
@@ -317,23 +416,23 @@ class MaquinaDineroLino:
             score, razones, alertas = calcular_score_rebote(
                 estado_hmm, rsi, sk, sd,
                 macd_val, signal_val,
-                agotamiento, velas_rev, precio_vs_bb
+                agot_nivel, velas_rev, precio_vs_bb
             )
 
             niveles = calcular_niveles_trading(df_chart, precio_actual)
 
             if score >= 70:
-                senal  = "ENTRAR — REBOTE PROBABLE"
-                color  = "#00ff88"
+                senal = "ENTRAR — REBOTE PROBABLE"
+                color = "#00ff88"
             elif score >= 55:
-                senal  = "PREPARARSE — REBOTE POSIBLE"
-                color  = "#FFD700"
+                senal = "PREPARARSE — REBOTE POSIBLE"
+                color = "#FFD700"
             elif score <= 30:
-                senal  = "NO ENTRAR — TENDENCIA BAJISTA"
-                color  = "#ff4444"
+                senal = "NO ENTRAR — TENDENCIA BAJISTA"
+                color = "#ff4444"
             else:
-                senal  = "NEUTRO — SIN SENAL CLARA"
-                color  = "#FF8C00"
+                senal = "NEUTRO — SIN SENAL CLARA"
+                color = "#FF8C00"
 
             # Backtesting
             senales_bt = []
@@ -344,9 +443,8 @@ class MaquinaDineroLino:
                 sd_v         = sd_bt.iloc[-1]
                 m, s, _      = calcular_macd(close.iloc[:i+1])
                 mv, sv       = m.iloc[-1], s.iloc[-1]
-                c_val        = ((close.iloc[i] - close.iloc[i-1]) / close.iloc[i-1]) * 100
                 sc, _, _     = calcular_score_rebote(
-                    estado_hmm, r, sk_v, sd_v, mv, sv, (False, 0), [], 0
+                    estado_hmm, r, sk_v, sd_v, mv, sv, 0, [], 0
                 )
                 senales_bt.append(sc)
 
@@ -362,7 +460,8 @@ class MaquinaDineroLino:
                 "rsi": round(rsi, 1),
                 "stoch_k": round(sk, 1), "stoch_d": round(sd, 1),
                 "macd": round(macd_val, 4), "signal_line": round(signal_val, 4),
-                "agotamiento": agotamiento,
+                "agot_ok": agot_ok, "agot_nivel": agot_nivel,
+                "agot_desc": agot_desc, "agot_detalles": agot_detalles,
                 "velas_rev": velas_rev,
                 "razones": razones, "alertas": alertas,
                 "niveles": niveles,
@@ -380,12 +479,12 @@ def grafica_rebote_profesional(df, ticker, nombre, niveles, velas_rev):
     if df.empty or len(df) < 10:
         return None
 
-    close            = df['Close'].squeeze()
-    ema9             = close.ewm(span=9).mean()
-    ema21            = close.ewm(span=21).mean()
-    stoch_k, stoch_d = calcular_stoch_rsi(close)
+    close              = df['Close'].squeeze()
+    ema9               = close.ewm(span=9).mean()
+    ema21              = close.ewm(span=21).mean()
+    stoch_k, stoch_d   = calcular_stoch_rsi(close)
     macd, signal, hist = calcular_macd(close)
-    bb_up, _, bb_low = calcular_bollinger(close)
+    bb_up, _, bb_low   = calcular_bollinger(close)
 
     colores_velas = ['#00ff88' if c >= o else '#ff4444'
                      for c, o in zip(df['Close'], df['Open'])]
@@ -399,12 +498,11 @@ def grafica_rebote_profesional(df, ticker, nombre, niveles, velas_rev):
         subplot_titles=(
             f"Velas Diarias — {nombre} ({ticker})",
             "Volumen",
-            "Stoch RSI — Señal de Rebote",
+            "Stoch RSI — Senal de Rebote",
             "MACD"
         )
     )
 
-    # Panel 1: Velas + Bollinger + EMAs + Niveles
     fig.add_trace(go.Candlestick(
         x=df.index,
         open=df['Open'], high=df['High'],
@@ -424,7 +522,6 @@ def grafica_rebote_profesional(df, ticker, nombre, niveles, velas_rev):
     fig.add_trace(go.Scatter(x=df.index, y=ema21, name="EMA 21",
         line=dict(color='#00BFFF', width=1.5)), row=1, col=1)
 
-    # Niveles de trading
     primer_idx = df.index[max(0, len(df)-30)]
     ultimo_idx = df.index[-1]
     for y_val, color, etiqueta in [
@@ -441,7 +538,6 @@ def grafica_rebote_profesional(df, ticker, nombre, niveles, velas_rev):
             font=dict(color=color, size=10),
             bgcolor="rgba(0,0,0,0.5)", row=1, col=1)
 
-    # Marcadores de velas
     for fecha, tipo_vela, color_vela in velas_rev[-3:]:
         if fecha in df.index:
             precio_vela = float(df.loc[fecha, 'Low']) * 0.998
@@ -454,14 +550,12 @@ def grafica_rebote_profesional(df, ticker, nombre, niveles, velas_rev):
                 name=tipo_vela, showlegend=False
             ), row=1, col=1)
 
-    # Panel 2: Volumen
     fig.add_trace(go.Bar(x=df.index, y=df['Volume'],
         name="Volumen", marker_color=colores_velas, opacity=0.7), row=2, col=1)
     vol_avg = df['Volume'].rolling(20).mean()
     fig.add_trace(go.Scatter(x=df.index, y=vol_avg, name="Vol MA20",
         line=dict(color='#888888', width=1, dash='dot')), row=2, col=1)
 
-    # Panel 3: Stoch RSI
     fig.add_trace(go.Scatter(x=df.index, y=stoch_k,
         name="Stoch K", line=dict(color='#00ff88', width=2)), row=3, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=stoch_d,
@@ -471,7 +565,6 @@ def grafica_rebote_profesional(df, ticker, nombre, niveles, velas_rev):
     fig.add_hline(y=80, line_dash="dot", line_color="#ff4444", line_width=1, row=3, col=1)
     fig.add_hline(y=20, line_dash="dot", line_color="#00ff88", line_width=1, row=3, col=1)
 
-    # Panel 4: MACD
     fig.add_trace(go.Bar(x=df.index, y=hist,
         name="Histograma", marker_color=colores_hist, opacity=0.7), row=4, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=macd,   name="MACD",
@@ -514,7 +607,6 @@ with col_b:
     st.write(""); st.write("")
     buscar_btn = st.button("ANALIZAR", use_container_width=True)
 
-# Autocompletado
 if busqueda and len(busqueda) >= 2 and not buscar_btn:
     with st.spinner("Buscando..."):
         sugs = buscar_sugerencias(busqueda)
@@ -527,7 +619,7 @@ if busqueda and len(busqueda) >= 2 and not buscar_btn:
         st.session_state.nombre_sel = sugs[idx]["nombre"]
         st.session_state.pais_sel   = sugs[idx]["pais"]
         st.info(f"Seleccionado: **{st.session_state.nombre_sel}** "
-                f"`{st.session_state.ticker_sel}` {st.session_state.pais_sel}")
+                f"`{st.session_state.ticker_sel}` [{st.session_state.pais_sel}]")
 
 col_r1, _ = st.columns([1, 5])
 with col_r1:
@@ -539,7 +631,7 @@ ticker_a_usar = st.session_state.ticker_sel or busqueda.upper().strip()
 nombre_a_usar = st.session_state.nombre_sel or busqueda
 
 if buscar_btn and ticker_a_usar:
-    with st.spinner("AI.Lino analizando rebote..."):
+    with st.spinner("AI.Lino analizando..."):
         maquina          = MaquinaDineroLino()
         resultado, error = maquina.analizar(ticker_a_usar)
 
@@ -547,7 +639,6 @@ if buscar_btn and ticker_a_usar:
         st.error(f"Error: {error}")
     elif resultado:
 
-        # Señal principal
         st.markdown(f"""
         <div style='background: linear-gradient(135deg, #0f0c29, #302b63); 
              padding: 30px; border-radius: 15px; text-align: center;
@@ -561,21 +652,47 @@ if buscar_btn and ticker_a_usar:
         </div>
         """, unsafe_allow_html=True)
 
-        # Niveles de trading
+        # Niveles
         niv = resultado["niveles"]
         st.markdown("### Niveles de Trading")
         n1, n2, n3, n4, n5 = st.columns(5)
-        n1.metric("Entrada Ideal",     f"${niv['entrada']:.2f}")
-        n2.metric("Stop Loss",         f"${niv['stop_loss']:.2f}",
+        n1.metric("Entrada Ideal",      f"${niv['entrada']:.2f}")
+        n2.metric("Stop Loss",          f"${niv['stop_loss']:.2f}",
                   delta=f"-{niv['riesgo_pct']:.1f}%", delta_color="inverse")
-        n3.metric("Objetivo 1",        f"${niv['objetivo_1']:.2f}")
-        n4.metric("Objetivo 2",        f"${niv['objetivo_2']:.2f}",
+        n3.metric("Objetivo 1",         f"${niv['objetivo_1']:.2f}")
+        n4.metric("Objetivo 2",         f"${niv['objetivo_2']:.2f}",
                   delta=f"+{niv['pot_ganancia']:.1f}%")
         n5.metric("Riesgo / Beneficio", f"1 : {niv['rr_ratio']:.1f}")
         st.caption(f"ATR: ${niv['atr']:.2f} | Soporte: ${niv['soporte']:.2f} | "
-                   f"Resistencia: ${niv['resistencia']:.2f} | BB Inferior: ${niv['bb_low']:.2f}")
+                   f"Resistencia: ${niv['resistencia']:.2f} | BB Inf: ${niv['bb_low']:.2f}")
 
-        # Señales de rebote
+        # Agotamiento de vendedores — panel detallado
+        st.markdown("### Agotamiento de Vendedores")
+        nivel_colores = {0: "#ff4444", 1: "#FF8C00", 2: "#FFD700", 3: "#00ff88"}
+        nivel_iconos  = {0: "Sin confirmar", 1: "Debil", 2: "Moderado", 3: "FUERTE"}
+        nv = resultado["agot_nivel"]
+        color_agot = nivel_colores[nv]
+        st.markdown(f"""
+        <div style='background:#1a1a2e; border:2px solid {color_agot};
+             border-radius:12px; padding:16px; margin-bottom:12px;'>
+            <h3 style='color:{color_agot}; margin:0;'>
+                {nivel_iconos[nv]} — {resultado["agot_desc"]}
+            </h3>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if resultado["agot_detalles"]:
+            for detalle in resultado["agot_detalles"]:
+                st.success(f"✅ {detalle}")
+        else:
+            st.warning("Ninguna capa de agotamiento confirmada todavia")
+
+        # Velas de reversal
+        if resultado["velas_rev"]:
+            velas_str = " | ".join([v[1] for v in resultado["velas_rev"][-3:]])
+            st.success(f"Patrones de vela: {velas_str}")
+
+        # Senales y alertas
         st.markdown("### Analisis de Rebote")
         col_r, col_a = st.columns(2)
         with col_r:
@@ -586,16 +703,6 @@ if buscar_btn and ticker_a_usar:
             st.markdown("**Alertas**")
             for a in resultado["alertas"]:
                 st.warning(a)
-
-        agot = resultado["agotamiento"]
-        if agot[0]:
-            st.success(f"Agotamiento de vendedores confirmado — volumen cae {agot[1]}% — Rebote probable")
-        else:
-            st.warning("Agotamiento de vendedores no confirmado — esperar mas senales")
-
-        if resultado["velas_rev"]:
-            velas_str = " | ".join([v[1] for v in resultado["velas_rev"][-3:]])
-            st.success(f"Patrones de vela detectados: {velas_str}")
 
         # Indicadores
         st.markdown("### Indicadores")
@@ -629,7 +736,7 @@ if buscar_btn and ticker_a_usar:
         if fig:
             st.plotly_chart(fig, use_container_width=True)
 
-        st.caption(f"AI.LINO Pro | HMM + Stoch RSI + Volumen + Rebote | {ticker_a_usar}")
+        st.caption(f"AI.LINO Pro | HMM + Stoch RSI + Agotamiento 5 Capas | {ticker_a_usar}")
 
 st.markdown("---")
 st.markdown(
