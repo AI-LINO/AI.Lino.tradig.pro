@@ -1,4 +1,4 @@
-1import streamlit as st
+import streamlit as st
 import yfinance as yf
 import numpy as np
 from hmmlearn import hmm
@@ -93,27 +93,295 @@ def calcular_bollinger(precios, periodo=20):
     return media + 2*std, media, media - 2*std
 
 # ─────────────────────────────────────────────
+# SEMÁFORO DE MOMENTUM DOMINANTE
+# ─────────────────────────────────────────────
+def calcular_adx(df, periodo=14):
+    """Calcula ADX, +DI y -DI para medir fuerza y dirección de tendencia."""
+    high  = df['High'].squeeze()
+    low   = df['Low'].squeeze()
+    close = df['Close'].squeeze()
+
+    # True Range
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs()
+    ], axis=1).max(axis=1)
+
+    # Directional Movement
+    up   = high - high.shift()
+    down = low.shift() - low
+
+    plus_dm  = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+
+    atr_s      = tr.ewm(span=periodo, min_periods=periodo).mean()
+    plus_di    = 100 * plus_dm.ewm(span=periodo, min_periods=periodo).mean() / (atr_s + 1e-10)
+    minus_di   = 100 * minus_dm.ewm(span=periodo, min_periods=periodo).mean() / (atr_s + 1e-10)
+    dx         = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)
+    adx        = dx.ewm(span=periodo, min_periods=periodo).mean()
+
+    return adx, plus_di, minus_di
+
+
+def detectar_momentum_dominante(ticker):
+    """
+    Semáforo de momentum: detecta si hay una fuerza direccional fuerte
+    que pueda aplastar un rebote intradía.
+
+    Usa 4 capas:
+    1. ADX 15min — fuerza de tendencia (>25 fuerte, >40 muy fuerte)
+    2. EMAs en cascada 5min — dirección dominante
+    3. Ratio velas rojas/verdes últimas 20 velas
+    4. Volumen direccional — dinero detrás de la fuerza
+
+    Retorna: dict con color semáforo, dirección, fuerza, descripción
+    """
+    try:
+        t      = yf.Ticker(ticker)
+        df_15m = t.history(period="5d",  interval="15m")
+        df_5m  = t.history(period="2d",  interval="5m")
+
+        if df_15m.empty or len(df_15m) < 30:
+            return {"error": "Sin datos para semáforo"}
+
+        resultado = {}
+
+        # ── CAPA 1: ADX en 15 minutos ──
+        adx_s, pdi_s, mdi_s = calcular_adx(df_15m, periodo=14)
+        adx_val  = float(adx_s.iloc[-1])
+        pdi_val  = float(pdi_s.iloc[-1])
+        mdi_val  = float(mdi_s.iloc[-1])
+        adx_prev = float(adx_s.iloc[-4])  # hace ~1 hora
+
+        direccion_adx = "ALCISTA" if pdi_val > mdi_val else "BAJISTA"
+        adx_subiendo  = adx_val > adx_prev
+
+        resultado["adx"]           = round(adx_val, 1)
+        resultado["pdi"]           = round(pdi_val, 1)
+        resultado["mdi"]           = round(mdi_val, 1)
+        resultado["adx_subiendo"]  = adx_subiendo
+        resultado["direccion_adx"] = direccion_adx
+
+        # ── CAPA 2: EMAs en cascada 5 minutos ──
+        if not df_5m.empty and len(df_5m) >= 50:
+            close_5m = df_5m['Close'].squeeze()
+            ema9_5m  = close_5m.ewm(span=9).mean()
+            ema21_5m = close_5m.ewm(span=21).mean()
+            ema50_5m = close_5m.ewm(span=50).mean()
+
+            e9  = float(ema9_5m.iloc[-1])
+            e21 = float(ema21_5m.iloc[-1])
+            e50 = float(ema50_5m.iloc[-1])
+
+            # Pendiente de cada EMA (últimas 6 velas = 30 min)
+            pend_e9  = (e9  - float(ema9_5m.iloc[-6]))  / float(ema9_5m.iloc[-6])  * 100
+            pend_e21 = (e21 - float(ema21_5m.iloc[-6])) / float(ema21_5m.iloc[-6]) * 100
+            pend_e50 = (e50 - float(ema50_5m.iloc[-6])) / float(ema50_5m.iloc[-6]) * 100
+
+            # Cascada perfecta alcista: e9 > e21 > e50 todas subiendo
+            cascada_alcista = (e9 > e21 > e50) and (pend_e9 > 0) and (pend_e21 > 0)
+            # Cascada perfecta bajista: e9 < e21 < e50 todas bajando
+            cascada_bajista = (e9 < e21 < e50) and (pend_e9 < 0) and (pend_e21 < 0)
+
+            resultado["ema9"]             = round(e9, 4)
+            resultado["ema21"]            = round(e21, 4)
+            resultado["ema50"]            = round(e50, 4)
+            resultado["pend_e9"]          = round(pend_e9, 4)
+            resultado["cascada_alcista"]  = cascada_alcista
+            resultado["cascada_bajista"]  = cascada_bajista
+        else:
+            cascada_alcista = False
+            cascada_bajista = False
+            resultado["cascada_alcista"] = False
+            resultado["cascada_bajista"] = False
+
+        # ── CAPA 3: Ratio velas rojas vs verdes (últimas 20 velas 5min) ──
+        if not df_5m.empty and len(df_5m) >= 20:
+            ultimas_20 = df_5m.iloc[-20:]
+            verdes = sum(1 for c, o in zip(ultimas_20['Close'], ultimas_20['Open']) if c >= o)
+            rojas  = 20 - verdes
+            ratio_direccional = verdes / 20  # 1.0 = todo verde, 0.0 = todo rojo
+
+            resultado["velas_verdes"] = verdes
+            resultado["velas_rojas"]  = rojas
+            resultado["ratio_dir"]    = round(ratio_direccional, 2)
+        else:
+            ratio_direccional = 0.5
+            resultado["velas_verdes"] = 10
+            resultado["velas_rojas"]  = 10
+            resultado["ratio_dir"]    = 0.5
+
+        # ── CAPA 4: Volumen direccional ──
+        if not df_5m.empty and len(df_5m) >= 20:
+            ultimas = df_5m.iloc[-20:]
+            vol_verde = sum(
+                float(v) for c, o, v in zip(ultimas['Close'], ultimas['Open'], ultimas['Volume'])
+                if c >= o
+            )
+            vol_rojo = sum(
+                float(v) for c, o, v in zip(ultimas['Close'], ultimas['Open'], ultimas['Volume'])
+                if c < o
+            )
+            total_vol = vol_verde + vol_rojo + 1e-10
+            ratio_vol_dir = vol_verde / total_vol  # >0.6 = fuerza alcista con volumen
+
+            resultado["vol_verde_pct"] = round(vol_verde / total_vol * 100, 1)
+            resultado["vol_rojo_pct"]  = round(vol_rojo  / total_vol * 100, 1)
+            resultado["ratio_vol_dir"] = round(ratio_vol_dir, 2)
+        else:
+            ratio_vol_dir = 0.5
+            resultado["vol_verde_pct"] = 50
+            resultado["vol_rojo_pct"]  = 50
+            resultado["ratio_vol_dir"] = 0.5
+
+        # ── DECISIÓN DEL SEMÁFORO ──
+        # Puntaje de fuerza alcista (0-100)
+        score_alcista = 0
+        score_bajista = 0
+
+        # ADX aporta fuerza en la dirección que apunta
+        if adx_val > 40:
+            fuerza_adx = 40
+        elif adx_val > 25:
+            fuerza_adx = 25
+        elif adx_val > 15:
+            fuerza_adx = 10
+        else:
+            fuerza_adx = 0
+
+        if direccion_adx == "ALCISTA":
+            score_alcista += fuerza_adx
+        else:
+            score_bajista += fuerza_adx
+
+        # EMAs en cascada
+        if cascada_alcista:
+            score_alcista += 25
+        elif cascada_bajista:
+            score_bajista += 25
+
+        # Ratio velas
+        if ratio_direccional > 0.70:
+            score_alcista += 20
+        elif ratio_direccional < 0.30:
+            score_bajista += 20
+        elif ratio_direccional > 0.60:
+            score_alcista += 10
+        elif ratio_direccional < 0.40:
+            score_bajista += 10
+
+        # Volumen direccional
+        if ratio_vol_dir > 0.65:
+            score_alcista += 15
+        elif ratio_vol_dir < 0.35:
+            score_bajista += 15
+
+        score_neto = score_alcista - score_bajista  # positivo = alcista, negativo = bajista
+
+        resultado["score_alcista"] = score_alcista
+        resultado["score_bajista"] = score_bajista
+        resultado["score_neto"]    = score_neto
+
+        # ── SEMÁFORO FINAL ──
+        adx_fuerte = adx_val > 25
+
+        if abs(score_neto) < 20 and adx_val < 20:
+            # Sin fuerza dominante — ideal para rebotes
+            semaforo       = "VERDE"
+            color_sem      = "#00ff88"
+            icono          = "🟢"
+            titulo         = "SIN FUERZA DOMINANTE"
+            descripcion    = "Mercado en rango/lateral — condiciones ideales para rebote"
+            recomendacion  = "✅ Puedes operar el rebote con confianza"
+            impacto_rebote = "ALTO"
+
+        elif abs(score_neto) < 35 and adx_val < 30:
+            # Fuerza moderada
+            if score_neto > 0:
+                dir_txt = "ALCISTA moderada"
+                rec_txt = "✅ Fuerza alcista ayuda al rebote — buenas condiciones"
+                impacto = "FAVORABLE"
+            else:
+                dir_txt = "BAJISTA moderada"
+                rec_txt = "⚠️ Fuerza bajista presente — rebote posible pero será breve"
+                impacto = "LIMITADO"
+            semaforo       = "AMARILLO"
+            color_sem      = "#FFD700"
+            icono          = "🟡"
+            titulo         = f"FUERZA {dir_txt.upper()}"
+            descripcion    = f"ADX {adx_val:.0f} — tendencia {dir_txt}"
+            recomendacion  = rec_txt
+            impacto_rebote = impacto
+
+        else:
+            # Fuerza dominante fuerte
+            if score_neto > 0:
+                dir_txt = "ALCISTA"
+                rec_txt = "✅ Fuerza alcista dominante — rebote tiene respaldo, seguir tendencia"
+                impacto = "MUY FAVORABLE"
+                color_sem = "#00BFFF"
+                icono     = "🔵"
+            else:
+                dir_txt = "BAJISTA"
+                rec_txt = "🚨 Fuerza bajista dominante — rebote será aplastado, NO entrar"
+                impacto = "BLOQUEADO"
+                color_sem = "#ff4444"
+                icono     = "🔴"
+            semaforo       = "ROJO" if score_neto < 0 else "AZUL"
+            titulo         = f"FUERZA DOMINANTE {dir_txt}"
+            descripcion    = (
+                f"ADX {adx_val:.0f} {'↑ subiendo' if adx_subiendo else '↓ bajando'} — "
+                f"+DI {pdi_val:.0f} vs -DI {mdi_val:.0f}"
+            )
+            recomendacion  = rec_txt
+            impacto_rebote = impacto
+
+        resultado["semaforo"]       = semaforo
+        resultado["color_sem"]      = color_sem
+        resultado["icono"]          = icono
+        resultado["titulo"]         = titulo
+        resultado["descripcion"]    = descripcion
+        resultado["recomendacion"]  = recomendacion
+        resultado["impacto_rebote"] = impacto_rebote
+
+        return resultado
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ─────────────────────────────────────────────
 # ██████████████████████████████████████████████
 # MÓDULO NUEVO: DETECTOR DE PISO INTRADÍA
 # ██████████████████████████████████████████████
 # ─────────────────────────────────────────────
 def detectar_piso_intraday(ticker):
     """
-    Detecta el piso intradía en tiempo real usando velas de 5 minutos.
-    
-    Lógica:
-    1. Caída de precio + caída de volumen simultánea = vendedores agotándose
-    2. Vela de rechazo (mecha inferior larga) en zona de soporte
-    3. Stoch RSI en sobreventa extrema en timeframe corto
-    
-    Retorna: dict con señal, precio_piso, stop, objetivo, confianza
+    Detecta el piso intradía con contexto histórico de 10 días.
+
+    Capas:
+    A) CONTEXTO HISTÓRICO — ¿Vale la pena entrar hoy?
+       - Posición del precio en el rango de 10 días (techo/piso/medio)
+       - Rango promedio diario real vs caída de hoy
+       - Velocidad de caída (¿caída libre o corrección normal?)
+       - Soportes reales de múltiples días
+    B) SEÑALES INTRADÍA — ¿El piso ya se está formando?
+       - Caída + volumen decreciente
+       - Velas de rechazo en 5min
+       - Stoch RSI en sobreventa
+       - Compresión de rangos
+
+    Retorna: dict completo con contexto + señal + niveles
     """
     try:
-        t       = yf.Ticker(ticker)
-        # Velas de 5 minutos — últimas 2 sesiones
-        df_5m   = t.history(period="2d", interval="5m")
-        # Velas de 1 hora — última semana para niveles
-        df_1h   = t.history(period="5d", interval="1h")
+        t = yf.Ticker(ticker)
+
+        # ── DATOS MULTI-TIMEFRAME ──
+        df_5m  = t.history(period="5d",  interval="5m")   # 5 días en 5min
+        df_15m = t.history(period="10d", interval="15m")  # 10 días en 15min
+        df_1h  = t.history(period="30d", interval="1h")   # 30 días en 1h
+        df_1d  = t.history(period="30d", interval="1d")   # 30 días diario
 
         if df_5m.empty or len(df_5m) < 20:
             return {"error": "Sin datos intradía suficientes"}
@@ -128,9 +396,224 @@ def detectar_piso_intraday(ticker):
         puntos        = 0
         señales       = []
         alertas_id    = []
+        contexto      = {}   # Dict para mostrar en UI
 
-        # ── CONDICIÓN 1: Caída de precio + caída de volumen ──
-        # Buscar secuencia de 3+ velas bajistas con volumen decreciente
+        # ════════════════════════════════════════════════
+        # BLOQUE A — CONTEXTO HISTÓRICO (multi-día)
+        # ════════════════════════════════════════════════
+
+        # ── A1: Rango promedio diario real (últimos 10 días) ──
+        # Calcula cuánto se mueve NORMALMENTE esta acción en un día
+        rangos_diarios = []
+        if not df_1d.empty and len(df_1d) >= 5:
+            close_1d = df_1d['Close'].squeeze()
+            high_1d  = df_1d['High'].squeeze()
+            low_1d   = df_1d['Low'].squeeze()
+            for i in range(-min(10, len(df_1d)), 0):
+                rango_d = float(high_1d.iloc[i]) - float(low_1d.iloc[i])
+                rangos_diarios.append(rango_d)
+            rango_promedio_diario = sum(rangos_diarios) / len(rangos_diarios)
+        else:
+            rango_promedio_diario = precio_actual * 0.015  # fallback 1.5%
+
+        contexto["rango_prom_diario"] = round(rango_promedio_diario, 2)
+
+        # ── A2: ¿Cuánto ha caído hoy vs el promedio? ──
+        # Si hoy cayó más del promedio = caída inusual/fuerte
+        # Si cayó menos = corrección normal, rebote más probable
+        precio_apertura_hoy = None
+        if not df_5m.empty:
+            # Detectar apertura de la sesión de hoy (primeras velas del día)
+            hoy = pd.Timestamp.now().date()
+            velas_hoy = df_5m[df_5m.index.date == hoy]
+            if not velas_hoy.empty:
+                precio_apertura_hoy = float(velas_hoy['Open'].iloc[0])
+                min_hoy  = float(velas_hoy['Low'].squeeze().min())
+                max_hoy  = float(velas_hoy['High'].squeeze().max())
+                caida_hoy = precio_apertura_hoy - precio_actual
+                caida_pct = (caida_hoy / precio_apertura_hoy) * 100 if precio_apertura_hoy > 0 else 0
+            else:
+                # Usar últimas ~78 velas de 5min = ~1 sesión completa
+                min_hoy  = float(low_5m.iloc[-78:].min())
+                max_hoy  = float(high_5m.iloc[-78:].max())
+                caida_hoy = 0
+                caida_pct = 0
+        else:
+            min_hoy  = float(low_5m.min())
+            max_hoy  = float(high_5m.max())
+            caida_hoy = 0
+            caida_pct = 0
+
+        contexto["min_hoy"]     = round(min_hoy, 2)
+        contexto["max_hoy"]     = round(max_hoy, 2)
+        contexto["caida_hoy"]   = round(caida_hoy, 2)
+        contexto["caida_pct"]   = round(caida_pct, 2)
+
+        ratio_caida = (caida_hoy / rango_promedio_diario) if rango_promedio_diario > 0 else 0
+        contexto["ratio_caida"] = round(ratio_caida, 2)
+
+        if ratio_caida > 1.5:
+            alertas_id.append(
+                f"🚨 Caída de hoy (${caida_hoy:.2f}) es {ratio_caida:.1f}x el rango normal "
+                f"(${rango_promedio_diario:.2f}) — posible caída libre, NO entrar aún"
+            )
+            puntos -= 3  # Penalización fuerte
+        elif ratio_caida > 1.0:
+            alertas_id.append(
+                f"⚠️ Caída de hoy supera el rango promedio ({ratio_caida:.1f}x) — cautela"
+            )
+            puntos -= 1
+        elif ratio_caida > 0.3:
+            puntos += 2
+            señales.append(
+                f"✅ Caída de hoy ({caida_pct:.1f}%) dentro del rango normal — corrección sana"
+            )
+        else:
+            alertas_id.append("ℹ️ Precio apenas ha bajado hoy — esperar corrección mayor")
+
+        # ── A3: Posición del precio en el rango de 10 días ──
+        # ¿Está en el techo, en el piso, o en el medio?
+        if not df_15m.empty and len(df_15m) >= 20:
+            high_10d = float(df_15m['High'].squeeze().max())
+            low_10d  = float(df_15m['Low'].squeeze().min())
+            rango_10d = high_10d - low_10d
+
+            if rango_10d > 0:
+                posicion_pct = ((precio_actual - low_10d) / rango_10d) * 100
+                contexto["posicion_10d_pct"] = round(posicion_pct, 1)
+                contexto["high_10d"]         = round(high_10d, 2)
+                contexto["low_10d"]          = round(low_10d, 2)
+
+                if posicion_pct <= 20:
+                    puntos += 4
+                    señales.append(
+                        f"🎯 Precio en el PISO del rango 10 días ({posicion_pct:.0f}%) "
+                        f"— zona de máximo valor histórico reciente"
+                    )
+                elif posicion_pct <= 35:
+                    puntos += 2
+                    señales.append(
+                        f"📍 Precio en zona baja del rango 10 días ({posicion_pct:.0f}%) "
+                        f"— buena zona de entrada"
+                    )
+                elif posicion_pct >= 80:
+                    alertas_id.append(
+                        f"🚫 Precio en el TECHO del rango 10 días ({posicion_pct:.0f}%) "
+                        f"— NO es zona de compra, esperar corrección"
+                    )
+                    puntos -= 4  # Penalización fuerte por comprar en techo
+                elif posicion_pct >= 65:
+                    alertas_id.append(
+                        f"⚠️ Precio en zona alta del rango 10 días ({posicion_pct:.0f}%) "
+                        f"— riesgo elevado de entrar aquí"
+                    )
+                    puntos -= 2
+                else:
+                    señales.append(
+                        f"➡️ Precio en zona media del rango ({posicion_pct:.0f}%) "
+                        f"— esperar que baje más para mejor entrada"
+                    )
+        else:
+            posicion_pct = 50
+            contexto["posicion_10d_pct"] = 50
+            contexto["high_10d"] = max_hoy
+            contexto["low_10d"]  = min_hoy
+
+        # ── A4: Velocidad de caída (¿caída libre o freno?) ──
+        # Compara velocidad de caída en últimas 6 velas 15min vs anteriores
+        if not df_15m.empty and len(df_15m) >= 20:
+            close_15m = df_15m['Close'].squeeze()
+            # Velocidad = cambio promedio por vela
+            vel_rec = abs(float(close_15m.iloc[-6:].diff().mean()))
+            vel_ant = abs(float(close_15m.iloc[-18:-6].diff().mean()))
+            if vel_ant > 0:
+                ratio_vel = vel_rec / vel_ant
+                contexto["ratio_velocidad"] = round(ratio_vel, 2)
+                if ratio_vel > 2.0:
+                    alertas_id.append(
+                        f"🚨 Velocidad de caída acelerada ({ratio_vel:.1f}x normal) "
+                        f"— caída libre, esperar estabilización"
+                    )
+                    puntos -= 2
+                elif ratio_vel < 0.5:
+                    puntos += 2
+                    señales.append(
+                        f"🐢 Caída desacelerando ({ratio_vel:.1f}x) "
+                        f"— momentum bajista perdiendo fuerza"
+                    )
+                else:
+                    contexto["ratio_velocidad"] = round(ratio_vel, 2)
+
+        # ── A5: Soportes reales de múltiples días ──
+        # Identifica niveles donde el precio rebotó en los últimos 10 días
+        soportes_reales = []
+        if not df_1h.empty and len(df_1h) >= 10:
+            low_1h  = df_1h['Low'].squeeze()
+            high_1h = df_1h['High'].squeeze()
+
+            # Soporte fuerte = mínimo que se tocó 2+ veces sin romperse
+            min_10d_abs = float(low_1h.min())
+            min_5d      = float(low_1h.iloc[-5*8:].min())   # ~5 días en 1h
+            min_3d      = float(low_1h.iloc[-3*8:].min())   # ~3 días
+            percentil_10 = float(np.percentile(low_1h, 10))  # 10% más bajo
+
+            # Soporte más cercano por abajo del precio actual
+            candidatos = [min_10d_abs, min_5d, min_3d, percentil_10]
+            for s in candidatos:
+                if s < precio_actual * 1.02:  # Dentro del 2% por debajo
+                    soportes_reales.append(round(s, 2))
+
+            soportes_reales = sorted(list(set(soportes_reales)), reverse=True)
+            contexto["soportes_reales"] = soportes_reales[:3]
+
+            # ¿El precio actual está cerca de un soporte real?
+            for s in soportes_reales:
+                dist_pct = ((precio_actual - s) / precio_actual) * 100
+                if dist_pct <= 0.5:
+                    puntos += 4
+                    señales.append(
+                        f"🧱 Precio EN soporte histórico multi-día (${s:.2f}) "
+                        f"— nivel testado previamente"
+                    )
+                    break
+                elif dist_pct <= 1.5:
+                    puntos += 2
+                    señales.append(
+                        f"📌 Precio cerca de soporte histórico (${s:.2f}, -{dist_pct:.1f}%) "
+                        f"— zona de interés"
+                    )
+                    break
+        else:
+            contexto["soportes_reales"] = [round(min_hoy, 2)]
+
+        # ── A6: ¿Rebotó desde este nivel antes? (validación de soporte) ──
+        if not df_1h.empty and len(df_1h) >= 20 and soportes_reales:
+            low_1h   = df_1h['Low'].squeeze()
+            close_1h = df_1h['Close'].squeeze()
+            soporte_ref = soportes_reales[0]
+            tolerancia  = soporte_ref * 0.015
+            rebotes_confirmados = 0
+            for i in range(len(df_1h) - 1):
+                if abs(float(low_1h.iloc[i]) - soporte_ref) <= tolerancia:
+                    if float(close_1h.iloc[i+1]) > float(close_1h.iloc[i]):
+                        rebotes_confirmados += 1
+            if rebotes_confirmados >= 2:
+                puntos += 3
+                señales.append(
+                    f"🔁 Soporte ${soporte_ref:.2f} confirmado con "
+                    f"{rebotes_confirmados} rebotes previos — nivel validado"
+                )
+            elif rebotes_confirmados == 1:
+                puntos += 1
+                señales.append(
+                    f"🔁 Soporte ${soporte_ref:.2f} con 1 rebote previo — nivel a vigilar"
+                )
+
+        # ════════════════════════════════════════════════
+        # BLOQUE B — SEÑALES INTRADÍA (5 min)
+        # ════════════════════════════════════════════════
+
+        # ── B1: Caída de precio + caída de volumen ──
         bajistas_consecutivas = 0
         vol_decreciente       = True
         for i in range(-6, -1):
@@ -144,20 +627,24 @@ def detectar_piso_intraday(ticker):
 
         if bajistas_consecutivas >= 3 and vol_decreciente:
             puntos += 3
-            señales.append(f"🔴 Caída {bajistas_consecutivas} velas con volumen decreciente — vendedores agotándose")
+            señales.append(
+                f"📉 Caída {bajistas_consecutivas} velas con volumen decreciente "
+                f"— vendedores agotándose en 5min"
+            )
         elif bajistas_consecutivas >= 2:
             puntos += 1
-            señales.append(f"⚠️ Presión bajista ({bajistas_consecutivas} velas) — vigilar volumen")
+            señales.append(f"⚠️ Presión bajista ({bajistas_consecutivas} velas) — vigilar")
 
-        # Caída de volumen general en últimas 5 velas vs 10 anteriores
-        vol_rec = float(volume_5m.iloc[-5:].mean())
-        vol_ant = float(volume_5m.iloc[-15:-5].mean())
-        if vol_ant > 0 and vol_rec < vol_ant * 0.70:
-            reduccion_vol = ((vol_ant - vol_rec) / vol_ant) * 100
+        vol_rec_5 = float(volume_5m.iloc[-5:].mean())
+        vol_ant_5 = float(volume_5m.iloc[-15:-5].mean())
+        if vol_ant_5 > 0 and vol_rec_5 < vol_ant_5 * 0.70:
+            reduccion_vol = ((vol_ant_5 - vol_rec_5) / vol_ant_5) * 100
             puntos += 2
-            señales.append(f"📉 Volumen cayó {reduccion_vol:.0f}% en últimas 5 velas — vendedores secándose")
+            señales.append(
+                f"📉 Volumen cayó {reduccion_vol:.0f}% en últimas 5 velas — vendedores secándose"
+            )
 
-        # ── CONDICIÓN 2: Vela de rechazo (mecha inferior larga) ──
+        # ── B2: Vela de rechazo ──
         rechazos_5m = 0
         for i in range(-4, 0):
             o = float(open_5m.iloc[i])
@@ -167,36 +654,40 @@ def detectar_piso_intraday(ticker):
             cuerpo    = abs(c - o) + 1e-10
             mecha_inf = min(o, c) - l
             rango     = h - l + 1e-10
-            # Hammer o Pin Bar: mecha inferior > 2x cuerpo y ocupa >35% del rango
             if mecha_inf > cuerpo * 1.8 and mecha_inf / rango > 0.35:
                 rechazos_5m += 1
-            # Doji (indecisión)
             elif cuerpo / rango < 0.15 and rango > 0:
                 rechazos_5m += 0.5
 
         if rechazos_5m >= 2:
             puntos += 3
-            señales.append(f"🕯️ {int(rechazos_5m)} velas de rechazo en mínimos — compradores defendiendo")
+            señales.append(
+                f"🕯️ {int(rechazos_5m)} velas de rechazo — compradores defendiendo el piso"
+            )
         elif rechazos_5m >= 1:
             puntos += 2
             señales.append("🕯️ Vela de rechazo detectada — posible piso")
 
-        # ── CONDICIÓN 3: Stoch RSI en sobreventa intradía ──
+        # ── B3: Stoch RSI intradía ──
         if len(close_5m) >= 20:
             stoch_k_5m, stoch_d_5m = calcular_stoch_rsi(close_5m, periodo=14, smooth=3)
             sk_actual = float(stoch_k_5m.iloc[-1])
             sd_actual = float(stoch_d_5m.iloc[-1])
-
             if sk_actual < 10:
                 puntos += 3
-                señales.append(f"📊 Stoch RSI intradía extremo ({sk_actual:.1f}) — rebote inminente")
+                señales.append(
+                    f"📊 Stoch RSI 5min extremo ({sk_actual:.1f}) — rebote inminente"
+                )
             elif sk_actual < 20:
                 puntos += 2
-                señales.append(f"📊 Stoch RSI intradía en sobreventa ({sk_actual:.1f}) — zona de rebote")
+                señales.append(
+                    f"📊 Stoch RSI 5min en sobreventa ({sk_actual:.1f}) — zona de rebote"
+                )
             elif sk_actual < 30:
                 puntos += 1
-                señales.append(f"📊 Stoch RSI bajando ({sk_actual:.1f}) — acercándose a zona rebote")
-
+                señales.append(
+                    f"📊 Stoch RSI bajando ({sk_actual:.1f}) — acercándose a zona rebote"
+                )
             if sk_actual > sd_actual and sk_actual < 40:
                 puntos += 1
                 señales.append("📈 Stoch RSI cruzando al alza — impulso iniciando")
@@ -204,24 +695,7 @@ def detectar_piso_intraday(ticker):
             sk_actual = 50
             sd_actual = 50
 
-        # ── CONDICIÓN 4: Precio cerca de soporte horario ──
-        soporte_1h    = float(df_1h['Low'].squeeze().iloc[-20:].min()) if not df_1h.empty else None
-        resistencia_1h = float(df_1h['High'].squeeze().iloc[-20:].max()) if not df_1h.empty else None
-        min_dia       = float(low_5m.min())
-        max_dia       = float(high_5m.max())
-
-        # Precio dentro del 1% del mínimo del día = zona de soporte
-        if precio_actual <= min_dia * 1.01:
-            puntos += 2
-            señales.append(f"🎯 Precio cerca del mínimo del día (${min_dia:.2f}) — soporte intradía")
-
-        # Precio cerca del soporte horario
-        if soporte_1h and precio_actual <= soporte_1h * 1.015:
-            puntos += 2
-            señales.append(f"🎯 Precio en soporte horario (${soporte_1h:.2f}) — nivel clave")
-
-        # ── CONDICIÓN 5: Compresión de rangos ──
-        # Velas cada vez más pequeñas = la caída pierde momentum
+        # ── B4: Compresión de rangos 5min ──
         rangos_rec = [float(high_5m.iloc[i]) - float(low_5m.iloc[i]) for i in range(-4, 0)]
         rangos_ant = [float(high_5m.iloc[i]) - float(low_5m.iloc[i]) for i in range(-8, -4)]
         if rangos_ant and sum(rangos_ant) > 0:
@@ -230,72 +704,91 @@ def detectar_piso_intraday(ticker):
             if rango_rec_avg < rango_ant_avg * 0.75:
                 compresion = ((rango_ant_avg - rango_rec_avg) / rango_ant_avg) * 100
                 puntos += 2
-                señales.append(f"🔇 Rango comprimido {compresion:.0f}% — la caída pierde velocidad")
+                señales.append(
+                    f"🔇 Rango comprimido {compresion:.0f}% — la caída pierde velocidad"
+                )
 
-        # ── NIVELES DE OPERACIÓN INTRADÍA ──
+        # ── NIVELES DE OPERACIÓN (basados en contexto histórico) ──
         atr_5m    = float((high_5m - low_5m).rolling(14).mean().iloc[-1])
+        soporte_1h = contexto.get("soportes_reales", [precio_actual * 0.99])[0] \
+                     if contexto.get("soportes_reales") else precio_actual * 0.99
+
         entrada   = round(precio_actual, 2)
-        stop_loss = round(min_dia - atr_5m * 0.5, 2)
-        objetivo1 = round(precio_actual + atr_5m * 2, 2)
-        objetivo2 = round(precio_actual + atr_5m * 4, 2)
+        # Stop bajo el soporte histórico más cercano, no solo el mínimo de hoy
+        stop_loss = round(soporte_1h - atr_5m * 0.8, 2)
+        objetivo1 = round(precio_actual + atr_5m * 2.5, 2)
+        objetivo2 = round(precio_actual + atr_5m * 5.0, 2)
         riesgo    = round(((precio_actual - stop_loss) / precio_actual) * 100, 2)
         ganancia  = round(((objetivo1 - precio_actual) / precio_actual) * 100, 2)
         rr        = round(ganancia / riesgo, 1) if riesgo > 0 else 0
 
-        # ── ALERTAS ──
-        rsi_5m = calcular_rsi(close_5m).iloc[-1]
+        # ── ALERTAS ADICIONALES ──
+        rsi_5m = float(calcular_rsi(close_5m).iloc[-1])
         if rsi_5m > 60:
-            alertas_id.append(f"⚠️ RSI intradía elevado ({rsi_5m:.1f}) — no es zona de compra")
-        if bajistas_consecutivas == 0:
-            alertas_id.append("ℹ️ No hay tendencia bajista activa — esperar corrección")
+            alertas_id.append(
+                f"⚠️ RSI 5min elevado ({rsi_5m:.1f}) — precio sobrecomprado en intradía"
+            )
+        if bajistas_consecutivas == 0 and ratio_caida < 0.2:
+            alertas_id.append(
+                "ℹ️ El precio no ha bajado suficiente hoy — esperar corrección antes de entrar"
+            )
 
-        # ── DECISIÓN FINAL ──
-        if puntos >= 10:
+        # ── DECISIÓN FINAL con penalizaciones aplicadas ──
+        if puntos >= 12:
             nivel     = "FUERTE"
             color     = "#00ff88"
             señal_txt = "🟢 POSIBLE PISO — ENTRAR AHORA"
-            confianza = min(95, 60 + puntos * 2)
-        elif puntos >= 7:
+            confianza = min(95, 55 + puntos * 2)
+        elif puntos >= 8:
             nivel     = "MODERADO"
             color     = "#FFD700"
             señal_txt = "🟡 PISO PROBABLE — PREPARARSE"
-            confianza = min(75, 45 + puntos * 2)
+            confianza = min(78, 40 + puntos * 2)
         elif puntos >= 4:
             nivel     = "DEBIL"
             color     = "#FF8C00"
             señal_txt = "🟠 PRIMERAS SEÑALES — VIGILAR"
-            confianza = min(55, 30 + puntos * 2)
+            confianza = min(55, 25 + puntos * 2)
         else:
             nivel     = "SIN SEÑAL"
             color     = "#ff4444"
-            señal_txt = "🔴 SIN PISO DETECTADO — ESPERAR"
-            confianza = max(10, puntos * 5)
+            señal_txt = "🔴 NO ENTRAR — CONDICIONES DESFAVORABLES"
+            confianza = max(5, puntos * 4)
 
         return {
-            "señal":         señal_txt,
-            "nivel":         nivel,
-            "color":         color,
-            "puntos":        puntos,
-            "confianza":     confianza,
-            "precio_actual": precio_actual,
-            "min_dia":       min_dia,
-            "max_dia":       max_dia,
-            "soporte_1h":    soporte_1h,
-            "resistencia_1h": resistencia_1h,
-            "entrada":       entrada,
-            "stop_loss":     stop_loss,
-            "objetivo1":     objetivo1,
-            "objetivo2":     objetivo2,
-            "riesgo_pct":    riesgo,
-            "ganancia_pct":  ganancia,
-            "rr":            rr,
-            "atr_5m":        round(atr_5m, 4),
-            "stoch_k_5m":    round(sk_actual, 1),
-            "rsi_5m":        round(float(rsi_5m), 1),
-            "señales":       señales,
-            "alertas":       alertas_id,
-            "df_5m":         df_5m,
-            "df_1h":         df_1h,
+            "señal":              señal_txt,
+            "nivel":              nivel,
+            "color":              color,
+            "puntos":             puntos,
+            "confianza":          confianza,
+            "precio_actual":      precio_actual,
+            "min_hoy":            contexto.get("min_hoy", min_hoy),
+            "max_hoy":            contexto.get("max_hoy", max_hoy),
+            "high_10d":           contexto.get("high_10d", max_hoy),
+            "low_10d":            contexto.get("low_10d",  min_hoy),
+            "posicion_10d_pct":   contexto.get("posicion_10d_pct", 50),
+            "rango_prom_diario":  contexto.get("rango_prom_diario", 0),
+            "caida_hoy":          contexto.get("caida_hoy", 0),
+            "caida_pct":          contexto.get("caida_pct", 0),
+            "ratio_caida":        contexto.get("ratio_caida", 0),
+            "ratio_velocidad":    contexto.get("ratio_velocidad", 1),
+            "soportes_reales":    contexto.get("soportes_reales", []),
+            "soporte_1h":         soporte_1h,
+            "resistencia_1h":     contexto.get("high_10d", max_hoy),
+            "entrada":            entrada,
+            "stop_loss":          stop_loss,
+            "objetivo1":          objetivo1,
+            "objetivo2":          objetivo2,
+            "riesgo_pct":         riesgo,
+            "ganancia_pct":       ganancia,
+            "rr":                 rr,
+            "atr_5m":             round(atr_5m, 4),
+            "stoch_k_5m":         round(sk_actual, 1),
+            "rsi_5m":             round(rsi_5m, 1),
+            "señales":            señales,
+            "alertas":            alertas_id,
+            "df_5m":              df_5m,
+            "df_1h":              df_1h,
         }
 
     except Exception as e:
@@ -953,6 +1446,81 @@ if buscar_btn and ticker_a_usar:
         </div>
         """, unsafe_allow_html=True)
 
+        with st.spinner("Analizando momentum dominante..."):
+            mom = detectar_momentum_dominante(ticker_a_usar)
+
+        if "error" not in mom:
+            # ── SEMÁFORO PRINCIPAL ──
+            st.markdown(f"""
+            <div style='background: linear-gradient(135deg, #0f0c29, #1a1a3e);
+                 padding: 20px; border-radius: 12px; text-align: center;
+                 border: 3px solid {mom["color_sem"]}; margin: 10px 0;'>
+                <div style='display:flex; align-items:center; justify-content:center; gap:16px;'>
+                    <div style='font-size:3em;'>{mom["icono"]}</div>
+                    <div>
+                        <div style='color:{mom["color_sem"]}; font-size:1.6em; font-weight:bold;
+                             line-height:1.1;'>{mom["titulo"]}</div>
+                        <div style='color:#aaa; font-size:0.9em; margin-top:4px;'>
+                            {mom["descripcion"]}
+                        </div>
+                    </div>
+                </div>
+                <div style='margin-top:12px; background:rgba(0,0,0,0.3); border-radius:8px;
+                     padding:8px; color:{mom["color_sem"]}; font-size:1em;'>
+                    {mom["recomendacion"]}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # ── MÉTRICAS DEL SEMÁFORO ──
+            m1, m2, m3, m4, m5, m6 = st.columns(6)
+            m1.metric("ADX",
+                      f"{mom['adx']}",
+                      "↑ subiendo" if mom.get("adx_subiendo") else "↓ bajando")
+            m2.metric("+DI (Alcista)", f"{mom['pdi']}")
+            m3.metric("-DI (Bajista)", f"{mom['mdi']}")
+            m4.metric("Velas Verdes",
+                      f"{mom['velas_verdes']}/20",
+                      delta=f"{mom['velas_verdes']-10:+d}")
+            m5.metric("Vol Alcista",  f"{mom['vol_verde_pct']}%")
+            m6.metric("Vol Bajista",  f"{mom['vol_rojo_pct']}%")
+
+            # ── BARRA ADX VISUAL ──
+            adx_pct = min(mom['adx'], 60) / 60 * 100
+            if mom['adx'] < 20:
+                color_adx = "#888888"; label_adx = "Sin tendencia — ideal para rebotes"
+            elif mom['adx'] < 25:
+                color_adx = "#FFD700"; label_adx = "Tendencia débil"
+            elif mom['adx'] < 40:
+                color_adx = "#FF8C00"; label_adx = "Tendencia moderada"
+            else:
+                color_adx = "#ff4444"; label_adx = "Tendencia fuerte — no ir en contra"
+
+            st.markdown(f"""
+            <div style='margin: 8px 0 14px 0;'>
+                <div style='display:flex; justify-content:space-between;
+                     color:#888; font-size:0.78em; margin-bottom:3px;'>
+                    <span>ADX: <b style='color:{color_adx}'>{mom['adx']}</b>
+                    — {label_adx}</span>
+                    <span>EMAs: {'🟢 Cascada alcista' if mom.get('cascada_alcista')
+                              else '🔴 Cascada bajista' if mom.get('cascada_bajista')
+                              else '🟡 Sin cascada'}</span>
+                </div>
+                <div style='background:#1a1a2e; border-radius:6px; height:12px;'>
+                    <div style='background:{color_adx}; width:{adx_pct}%;
+                         height:100%; border-radius:6px; opacity:0.8;'></div>
+                </div>
+                <div style='display:flex; justify-content:space-between;
+                     color:#444; font-size:0.68em; margin-top:2px;'>
+                    <span>0 — Lateral</span>
+                    <span>25 — Tendencia</span>
+                    <span>40+ — Fuerza dominante</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown("---")
+
         with st.spinner("Analizando intradía (velas 5min)..."):
             id_result = detectar_piso_intraday(ticker_a_usar)
 
@@ -977,6 +1545,113 @@ if buscar_btn and ticker_a_usar:
             </div>
             """, unsafe_allow_html=True)
 
+            # ── CONTEXTO HISTÓRICO — Panel nuevo ──
+            st.markdown("#### 🗓️ Contexto Histórico (10 días)")
+
+            pos_pct  = id_result.get("posicion_10d_pct", 50)
+            ratio_c  = id_result.get("ratio_caida", 0)
+            ratio_v  = id_result.get("ratio_velocidad", 1)
+            caida_h  = id_result.get("caida_hoy", 0)
+            caida_p  = id_result.get("caida_pct", 0)
+            rpd      = id_result.get("rango_prom_diario", 0)
+            h10      = id_result.get("high_10d", 0)
+            l10      = id_result.get("low_10d", 0)
+            sops     = id_result.get("soportes_reales", [])
+
+            # Color según posición en rango
+            if pos_pct <= 20:
+                color_pos = "#00ff88"; label_pos = "🟢 PISO DEL RANGO"
+            elif pos_pct <= 35:
+                color_pos = "#7CFC00"; label_pos = "🟢 ZONA BAJA"
+            elif pos_pct >= 80:
+                color_pos = "#ff4444"; label_pos = "🔴 TECHO DEL RANGO"
+            elif pos_pct >= 65:
+                color_pos = "#FF8C00"; label_pos = "🟠 ZONA ALTA"
+            else:
+                color_pos = "#FFD700"; label_pos = "🟡 ZONA MEDIA"
+
+            # Color según velocidad de caída
+            if ratio_v > 2.0:
+                color_vel = "#ff4444"; label_vel = "🚨 CAÍDA LIBRE"
+            elif ratio_v < 0.5:
+                color_vel = "#00ff88"; label_vel = "✅ DESACELERANDO"
+            else:
+                color_vel = "#FFD700"; label_vel = "⚠️ NORMAL"
+
+            # Color según ratio de caída hoy
+            if ratio_c > 1.5:
+                color_caida = "#ff4444"; label_caida = "🚨 EXCESIVA"
+            elif ratio_c > 1.0:
+                color_caida = "#FF8C00"; label_caida = "⚠️ ELEVADA"
+            elif ratio_c > 0.3:
+                color_caida = "#00ff88"; label_caida = "✅ NORMAL"
+            else:
+                color_caida = "#888888"; label_caida = "➡️ MÍNIMA"
+
+            st.markdown(f"""
+            <div style='background:#0d0d1f; border:1px solid #333; border-radius:10px;
+                 padding:14px; margin-bottom:10px;'>
+                <div style='display:flex; gap:10px; flex-wrap:wrap;'>
+                    <div style='flex:1; min-width:130px; background:#1a1a2e; border-radius:8px;
+                         padding:10px; text-align:center;'>
+                        <div style='color:#888; font-size:0.75em;'>POSICIÓN EN RANGO 10d</div>
+                        <div style='color:{color_pos}; font-size:1.4em; font-weight:bold;'>{pos_pct:.0f}%</div>
+                        <div style='color:{color_pos}; font-size:0.8em;'>{label_pos}</div>
+                        <div style='color:#555; font-size:0.7em;'>Max:${h10:.2f} Min:${l10:.2f}</div>
+                    </div>
+                    <div style='flex:1; min-width:130px; background:#1a1a2e; border-radius:8px;
+                         padding:10px; text-align:center;'>
+                        <div style='color:#888; font-size:0.75em;'>CAÍDA HOY vs PROMEDIO</div>
+                        <div style='color:{color_caida}; font-size:1.4em; font-weight:bold;'>
+                            {ratio_c:.1f}x
+                        </div>
+                        <div style='color:{color_caida}; font-size:0.8em;'>{label_caida}</div>
+                        <div style='color:#555; font-size:0.7em;'>
+                            Bajó ${caida_h:.2f} ({caida_p:.1f}%) | Prom: ${rpd:.2f}
+                        </div>
+                    </div>
+                    <div style='flex:1; min-width:130px; background:#1a1a2e; border-radius:8px;
+                         padding:10px; text-align:center;'>
+                        <div style='color:#888; font-size:0.75em;'>VELOCIDAD DE CAÍDA</div>
+                        <div style='color:{color_vel}; font-size:1.4em; font-weight:bold;'>
+                            {ratio_v:.1f}x
+                        </div>
+                        <div style='color:{color_vel}; font-size:0.8em;'>{label_vel}</div>
+                        <div style='color:#555; font-size:0.7em;'>vs promedio últimas 3h</div>
+                    </div>
+                    <div style='flex:1; min-width:130px; background:#1a1a2e; border-radius:8px;
+                         padding:10px; text-align:center;'>
+                        <div style='color:#888; font-size:0.75em;'>SOPORTES HISTÓRICOS</div>
+                        {''.join([f"<div style='color:#9B59B6; font-size:1em; font-weight:bold;'>${s:.2f}</div>" for s in sops[:3]]) if sops else "<div style='color:#555'>Sin datos</div>"}
+                        <div style='color:#555; font-size:0.7em;'>niveles testados</div>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Barra visual de posición en rango
+            st.markdown(f"""
+            <div style='margin-bottom:12px;'>
+                <div style='color:#888; font-size:0.8em; margin-bottom:4px;'>
+                    Posición precio en rango de 10 días
+                    &nbsp;|&nbsp; 🟢 Piso &nbsp;←&nbsp; Comprar aquí &nbsp;→&nbsp; 🔴 Techo
+                </div>
+                <div style='background:#1a1a2e; border-radius:6px; height:18px; position:relative;'>
+                    <div style='background: linear-gradient(to right, #00ff88, #FFD700, #ff4444);
+                         height:100%; border-radius:6px; opacity:0.3;'></div>
+                    <div style='position:absolute; top:0; left:{min(max(pos_pct,2),98)}%;
+                         transform:translateX(-50%); height:18px; width:3px;
+                         background:{color_pos};'></div>
+                </div>
+                <div style='display:flex; justify-content:space-between;
+                     color:#555; font-size:0.7em;'>
+                    <span>Piso ${l10:.2f}</span>
+                    <span>Precio actual ${id_result["precio_actual"]:.2f}</span>
+                    <span>Techo ${h10:.2f}</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
             # Niveles intradía
             st.markdown("#### 📍 Niveles Intradía (ATR 5min)")
             i1, i2, i3, i4, i5 = st.columns(5)
@@ -988,14 +1663,12 @@ if buscar_btn and ticker_a_usar:
             i4.metric("Objetivo 2",      f"${id_result['objetivo2']:.2f}")
             i5.metric("R/B Intradía",    f"1 : {id_result['rr']:.1f}")
 
-            # Info extra intradía
             st.caption(
-                f"Mín día: ${id_result['min_dia']:.2f} | "
-                f"Máx día: ${id_result['max_dia']:.2f} | "
+                f"Mín hoy: ${id_result['min_hoy']:.2f} | "
+                f"Máx hoy: ${id_result['max_hoy']:.2f} | "
                 f"ATR 5min: ${id_result['atr_5m']:.3f} | "
                 f"Stoch RSI 5m: {id_result['stoch_k_5m']} | "
-                f"RSI 5m: {id_result['rsi_5m']} | "
-                + (f"Soporte 1h: ${id_result['soporte_1h']:.2f}" if id_result.get('soporte_1h') else "")
+                f"RSI 5m: {id_result['rsi_5m']}"
             )
 
             # Señales y alertas intradía
