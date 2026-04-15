@@ -6,6 +6,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import warnings
+import gc
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="AI.Lino Pro", page_icon="🤖", layout="wide")
@@ -20,8 +21,32 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# BUSQUEDA
+# CACHÉ DE DATOS — evita re-descargar yfinance
+# en cada interacción del usuario con la UI.
+# TTL=600s swing, TTL=30s precio RT
 # ─────────────────────────────────────────────
+@st.cache_data(ttl=600, show_spinner=False)
+def descargar_datos(ticker, period, interval):
+    try:
+        df   = yf.Ticker(ticker).history(period=period, interval=interval)
+        cols = [c for c in ['Open','High','Low','Close','Volume'] if c in df.columns]
+        return df[cols].copy()
+    except:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=30, show_spinner=False)
+def descargar_precio_rt(ticker):
+    try:
+        fi    = yf.Ticker(ticker).fast_info
+        precio = fi.last_price
+        prev   = fi.previous_close
+        if precio and prev:
+            return float(precio), float(((precio - prev) / prev) * 100)
+    except:
+        pass
+    return None, None
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def buscar_sugerencias(texto):
     try:
         resultados = yf.Search(texto, max_results=8)
@@ -50,15 +75,7 @@ def buscar_sugerencias(texto):
         return []
 
 def obtener_precio_realtime(ticker):
-    try:
-        fi     = yf.Ticker(ticker).fast_info
-        precio = fi.last_price
-        prev   = fi.previous_close
-        if precio and prev:
-            return precio, ((precio - prev) / prev) * 100
-    except:
-        pass
-    return None, None
+    return descargar_precio_rt(ticker)
 
 # ─────────────────────────────────────────────
 # INDICADORES
@@ -138,9 +155,8 @@ def detectar_momentum_dominante(ticker):
     Retorna: dict con color semáforo, dirección, fuerza, descripción
     """
     try:
-        t      = yf.Ticker(ticker)
-        df_15m = t.history(period="5d",  interval="15m")
-        df_5m  = t.history(period="2d",  interval="5m")
+        df_15m = descargar_datos(ticker, "5d",  "15m")
+        df_5m  = descargar_datos(ticker, "2d",  "5m")
 
         if df_15m.empty or len(df_15m) < 30:
             return {"error": "Sin datos para semáforo"}
@@ -378,10 +394,10 @@ def detectar_piso_intraday(ticker):
         t = yf.Ticker(ticker)
 
         # ── DATOS MULTI-TIMEFRAME ──
-        df_5m  = t.history(period="5d",  interval="5m")   # 5 días en 5min
-        df_15m = t.history(period="10d", interval="15m")  # 10 días en 15min
-        df_1h  = t.history(period="30d", interval="1h")   # 30 días en 1h
-        df_1d  = t.history(period="30d", interval="1d")   # 30 días diario
+        df_5m  = descargar_datos(ticker, "5d",  "5m")
+        df_15m = descargar_datos(ticker, "10d", "15m")
+        df_1h  = descargar_datos(ticker, "20d", "1h")
+        df_1d  = descargar_datos(ticker, "20d", "1d")
 
         if df_5m.empty or len(df_5m) < 20:
             return {"error": "Sin datos intradía suficientes"}
@@ -1126,7 +1142,7 @@ class MaquinaDineroLino:
     def analizar(self, ticker):
         try:
             t  = yf.Ticker(ticker)
-            df = t.history(period="2y", interval="1d")
+            df = descargar_datos(ticker, "2y", "1d")
             if df.empty or len(df) < 60:
                 return None, "No hay suficientes datos historicos"
 
@@ -1141,6 +1157,7 @@ class MaquinaDineroLino:
                 momentum.values[-min_len:]
             ])
             self.modelo.fit(X)
+            gc.collect()  # liberar memoria post-HMM
             _, states     = self.modelo.decode(X, algorithm="viterbi")
             means         = self.modelo.means_[:, 0]
             bull_state    = int(np.argmax(means))
@@ -1161,7 +1178,7 @@ class MaquinaDineroLino:
             macd_val         = macd.iloc[-1]
             signal_val       = signal.iloc[-1]
 
-            df_chart = t.history(period="3mo", interval="1d")
+            df_chart = descargar_datos(ticker, "3mo", "1d")
 
             agot_ok, agot_nivel, agot_desc, agot_detalles = detectar_agotamiento_vendedores(df_chart)
             velas_rev   = detectar_vela_rebote(df_chart.tail(10))
